@@ -1,141 +1,160 @@
-const Post = require('../models/Post');
-const Reply = require('../models/Reply');
-const { uploadImage } = require('../utils/imageUpload');
-const { sendNotification } = require('../utils/socket');
+const User = require('../models/User');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const { sendVerificationEmail } = require('../utils/emailService');
 
-// Create a new post
-exports.createPost = async (req, res) => {
+// Register a new user
+exports.register = async (req, res) => {
   try {
-    const { text } = req.body;
-    let imageUrl = '';
+    const { username, email, password } = req.body;
 
-    if (req.file) {
-      imageUrl = await uploadImage(req.file);
+    // Check if the user already exists
+    const existingUser = await User.findOne({ $or: [{ email }, { username }] });
+    if (existingUser) {
+      return res.status(400).json({ error: 'User already exists' });
     }
 
-    const post = new Post({
-      text,
-      imageUrl,
-      author: req.user ? req.user._id : null,
+    // Hash the password
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    // Create a new user
+    const user = new User({
+      username,
+      email,
+      password: hashedPassword,
     });
 
-    await post.save();
+    await user.save();
 
-    // Emit real-time event for new post
-    sendNotification('newPost', post);
+    // Send verification email
+    sendVerificationEmail(user.email, user._id);
 
-    res.status(201).json(post);
+    res.status(201).json({ message: 'User registered successfully. Please verify your email.' });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to create post' });
+    res.status(500).json({ error: 'Failed to register user' });
   }
 };
 
-// Get all posts
-exports.getAllPosts = async (req, res) => {
+// Login a user
+exports.login = async (req, res) => {
   try {
-    const posts = await Post.find().sort({ createdAt: -1 }).populate('replies');
-    res.status(200).json(posts);
+    const { email, password } = req.body;
+
+    // Find the user by email
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(400).json({ error: 'Invalid credentials' });
+    }
+
+    // Check if the password is correct
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    if (!isPasswordValid) {
+      return res.status(400).json({ error: 'Invalid credentials' });
+    }
+
+    // Check if the email is verified
+    if (!user.isVerified) {
+      return res.status(400).json({ error: 'Email not verified' });
+    }
+
+    // Generate a JWT token
+    const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, { expiresIn: '1h' });
+
+    res.status(200).json({ token });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch posts' });
+    res.status(500).json({ error: 'Failed to login' });
   }
 };
 
-// Get a single post by ID
-exports.getPostById = async (req, res) => {
+// Verify user email
+exports.verifyEmail = async (req, res) => {
   try {
-    const post = await Post.findById(req.params.id).populate('replies');
-    if (!post) {
-      return res.status(404).json({ error: 'Post not found' });
+    const { userId, token } = req.params;
+
+    // Find the user by ID
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(400).json({ error: 'Invalid verification link' });
     }
-    res.status(200).json(post);
+
+    // Verify the token
+    const isTokenValid = await bcrypt.compare(token, user.emailVerificationToken);
+    if (!isTokenValid) {
+      return res.status(400).json({ error: 'Invalid verification link' });
+    }
+
+    // Mark the email as verified
+    user.isVerified = true;
+    user.emailVerificationToken = undefined;
+    await user.save();
+
+    res.status(200).json({ message: 'Email verified successfully' });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch post' });
+    res.status(500).json({ error: 'Failed to verify email' });
   }
 };
 
-// Update a post by ID
-exports.updatePost = async (req, res) => {
+// Get user profile
+exports.getProfile = async (req, res) => {
   try {
-    const { text } = req.body;
-    let imageUrl = '';
-
-    if (req.file) {
-      imageUrl = await uploadImage(req.file);
+    const user = await User.findById(req.user._id).select('-password -emailVerificationToken');
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
     }
-
-    const post = await Post.findById(req.params.id);
-    if (!post) {
-      return res.status(404).json({ error: 'Post not found' });
-    }
-
-    post.text = text;
-    if (imageUrl) {
-      post.imageUrl = imageUrl;
-    }
-
-    await post.save();
-
-    // Emit real-time event for updated post
-    sendNotification('updatePost', post);
-
-    res.status(200).json(post);
+    res.status(200).json(user);
   } catch (error) {
-    res.status(500).json({ error: 'Failed to update post' });
+    res.status(500).json({ error: 'Failed to fetch user profile' });
   }
 };
 
-// Delete a post by ID
-exports.deletePost = async (req, res) => {
+// Update user profile
+exports.updateProfile = async (req, res) => {
   try {
-    const post = await Post.findById(req.params.id);
-    if (!post) {
-      return res.status(404).json({ error: 'Post not found' });
+    const { username, email } = req.body;
+
+    // Find the user by ID
+    const user = await User.findById(req.user._id);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
     }
 
-    await Post.findByIdAndDelete(req.params.id);
+    // Update user details
+    user.username = username || user.username;
+    user.email = email || user.email;
 
-    // Emit real-time event for deleted post
-    sendNotification('deletePost', req.params.id);
+    await user.save();
 
-    res.status(200).json({ message: 'Post deleted successfully' });
+    res.status(200).json({ message: 'Profile updated successfully' });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to delete post' });
+    res.status(500).json({ error: 'Failed to update profile' });
   }
 };
 
-// Add a reply to a post
-exports.addReply = async (req, res) => {
+// Change user password
+exports.changePassword = async (req, res) => {
   try {
-    const { text } = req.body;
-    let imageUrl = '';
+    const { currentPassword, newPassword } = req.body;
 
-    if (req.file) {
-      imageUrl = await uploadImage(req.file);
+    // Find the user by ID
+    const user = await User.findById(req.user._id);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
     }
 
-    const reply = new Reply({
-      text,
-      imageUrl,
-      author: req.user ? req.user._id : null,
-    });
-
-    await reply.save();
-
-    const post = await Post.findByIdAndUpdate(
-      req.params.id,
-      { $push: { replies: reply._id } },
-      { new: true }
-    ).populate('replies');
-
-    if (!post) {
-      return res.status(404).json({ error: 'Post not found' });
+    // Check if the current password is correct
+    const isPasswordValid = await bcrypt.compare(currentPassword, user.password);
+    if (!isPasswordValid) {
+      return res.status(400).json({ error: 'Invalid current password' });
     }
 
-    // Emit real-time event for new reply
-    sendNotification('newReply', { postId: req.params.id, reply });
+    // Hash the new password
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    user.password = hashedPassword;
 
-    res.status(201).json(reply);
+    await user.save();
+
+    res.status(200).json({ message: 'Password changed successfully' });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to add reply' });
+    res.status(500).json({ error: 'Failed to change password' });
   }
 };
